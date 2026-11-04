@@ -70,6 +70,44 @@ fn parse_args(args: Vec<&str>) -> io::Result<CopyOperation> {
     })
 }
 
+/// The OpenTelemetry injector is shipped once per architecture as `libotelinject_<arch>.so`.
+/// While copying, only the file built for this machine is installed, as `libotelinject.so`;
+/// the others are skipped. A wrong-architecture file in LD_PRELOAD makes musl refuse to start
+/// the process, while a missing file is ignored, so never install a non-matching one.
+/// This binary is statically linked for one architecture, so the architecture it was built
+/// for is the one it runs on.
+const INJECTOR_PREFIX: &str = "libotelinject_";
+const INJECTOR_SUFFIX: &str = ".so";
+const INJECTOR_NAME: &str = "libotelinject.so";
+
+fn machine_arch_name() -> &'static str {
+    match env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Where a file named `name` goes in `dest_dir`: `None` to skip it.
+fn injector_destination(dest_dir: &Path, name: &std::ffi::OsStr, arch: &str) -> Option<PathBuf> {
+    if let Some(n) = name.to_str() {
+        if let Some(a) = n
+            .strip_prefix(INJECTOR_PREFIX)
+            .and_then(|rest| rest.strip_suffix(INJECTOR_SUFFIX))
+        {
+            if a.is_empty() {
+                return Some(dest_dir.join(name));
+            }
+            return if a == arch {
+                Some(dest_dir.join(INJECTOR_NAME))
+            } else {
+                None
+            };
+        }
+    }
+    Some(dest_dir.join(name))
+}
+
 /// Execute the copy operation
 fn do_copy(operation: CopyOperation) -> io::Result<()> {
     match operation.copy_type {
@@ -80,33 +118,43 @@ fn do_copy(operation: CopyOperation) -> io::Result<()> {
     Ok(())
 }
 
+/// Recreate the symbolic link `source` at `dest` with the same (possibly relative or dangling) target.
+/// An existing file or link at `dest` is replaced, so copying into a volume that was filled before (an init
+/// container that runs again) still succeeds; an existing real directory at `dest` is left as it is.
+fn copy_symlink(source: &Path, dest: &Path) -> io::Result<()> {
+    let target = source.read_link()?;
+    if let Ok(existing) = fs::symlink_metadata(dest) {
+        if existing.is_dir() {
+            return Ok(());
+        }
+        fs::remove_file(dest)?;
+    }
+    unix::fs::symlink(target, dest)
+}
+
 fn copy_recursive(source: &Path, dest: &Path) -> io::Result<()> {
     let mut stack = VecDeque::new();
     stack.push_back((source.to_path_buf(), dest.to_path_buf()));
     while let Some((current_source, current_dest)) = stack.pop_back() {
-        // Keep symbolic links as links (like GNU and busybox `cp -r`) instead of
-        // following them, so a symlinked directory is not copied out as a second tree.
         if current_source.is_symlink() {
-            let target = current_source.read_link()?;
-            // Replace a link left by a previous run so re-running the copy succeeds.
-            if current_dest.is_symlink() {
-                fs::remove_file(&current_dest)?;
-            }
-            unix::fs::symlink(target, &current_dest)?;
+            // Copy symbolic links as symbolic links, like `cp -r`: never follow them, so a link to a
+            // directory (even a self-referencing one such as `glibc -> .`) is neither duplicated nor looped into.
+            copy_symlink(&current_source, &current_dest)?;
         } else if current_source.is_dir() {
             if !current_dest.exists() {
                 fs::create_dir(&current_dest)?;
             }
             for entry in fs::read_dir(current_source)? {
                 let next_source = entry?.path();
-                let next_dest =
-                    current_dest
-                        .clone()
-                        .join(next_source.file_name().ok_or(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "Invalid source file",
-                        ))?);
-                stack.push_back((next_source, next_dest));
+                let name = next_source.file_name().ok_or(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Invalid source file",
+                ))?;
+                if let Some(next_dest) =
+                    injector_destination(&current_dest, name, machine_arch_name())
+                {
+                    stack.push_back((next_source, next_dest));
+                }
             }
         } else if current_source.is_file() {
             fs::copy(current_source, current_dest)?;
@@ -121,22 +169,22 @@ fn copy_archive(source: &Path, dest: &Path) -> io::Result<()> {
     stack.push_back((source.to_path_buf(), dest.to_path_buf()));
     while let Some((current_source, current_dest)) = stack.pop_back() {
         if current_source.is_symlink() {
-            let target = current_source.read_link()?;
-            unix::fs::symlink(target, &current_dest)?;
+            copy_symlink(&current_source, &current_dest)?;
         } else if current_source.is_dir() {
             if !current_dest.exists() {
                 fs::create_dir(&current_dest)?;
             }
             for entry in fs::read_dir(current_source)? {
                 let next_source = entry?.path();
-                let next_dest =
-                    current_dest
-                        .clone()
-                        .join(next_source.file_name().ok_or(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "Invalid source file",
-                        ))?);
-                stack.push_back((next_source, next_dest));
+                let name = next_source.file_name().ok_or(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Invalid source file",
+                ))?;
+                if let Some(next_dest) =
+                    injector_destination(&current_dest, name, machine_arch_name())
+                {
+                    stack.push_back((next_source, next_dest));
+                }
             }
         } else if current_source.is_file() {
             fs::copy(current_source, current_dest)?;
@@ -317,6 +365,7 @@ mod tests {
             &test_base.join("foo/symlink1.txt"),
             &test_base.join("bar/symlink1.txt"),
         );
+        // recursive copy keeps symlinks as symlinks, like `cp -r`
         assert_same_link(
             &test_base.join("foo/symlink1.txt"),
             &test_base.join("bar/symlink1.txt"),
@@ -498,5 +547,123 @@ mod tests {
         assert!(dest.is_symlink());
 
         assert_eq!(fs::read_link(source).unwrap(), fs::read_link(dest).unwrap());
+    }
+
+    #[test]
+    fn injector_destination_picks_matching_arch() {
+        let d = Path::new("/dst");
+        let f = |n: &str, a: &str| crate::injector_destination(d, std::ffi::OsStr::new(n), a);
+        assert_eq!(
+            f("libotelinject_amd64.so", "amd64"),
+            Some(PathBuf::from("/dst/libotelinject.so"))
+        );
+        assert_eq!(f("libotelinject_arm64.so", "amd64"), None);
+        assert_eq!(
+            f("libotelinject_arm64.so", "arm64"),
+            Some(PathBuf::from("/dst/libotelinject.so"))
+        );
+        assert_eq!(f("libotelinject_amd64.so", "arm64"), None);
+        assert_eq!(
+            f("libotelinject.so", "amd64"),
+            Some(PathBuf::from("/dst/libotelinject.so"))
+        );
+        assert_eq!(
+            f("libotelinject_.so", "amd64"),
+            Some(PathBuf::from("/dst/libotelinject_.so"))
+        );
+        assert_eq!(f("other.so", "amd64"), Some(PathBuf::from("/dst/other.so")));
+        assert_eq!(
+            f("libotelinject_amd64.so.bak", "amd64"),
+            Some(PathBuf::from("/dst/libotelinject_amd64.so.bak"))
+        );
+    }
+
+    fn injector_tree_test(copy_type: CopyType) {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let inj = src.path().join("injector");
+        fs::create_dir(&inj).unwrap();
+        fs::write(inj.join("libotelinject_amd64.so"), b"amd64").unwrap();
+        fs::write(inj.join("libotelinject_arm64.so"), b"arm64").unwrap();
+        fs::write(inj.join("check-arch.sh"), b"sh").unwrap();
+        fs::write(src.path().join("sdk.py"), b"py").unwrap();
+        let out = dst.path().join("out");
+        do_copy(CopyOperation {
+            source: src.path().to_path_buf(),
+            destination: out.clone(),
+            copy_type,
+        })
+        .unwrap();
+        let mine = crate::machine_arch_name();
+        assert_eq!(
+            fs::read(out.join("injector/libotelinject.so")).unwrap(),
+            mine.as_bytes()
+        );
+        assert!(!out.join("injector/libotelinject_amd64.so").exists());
+        assert!(!out.join("injector/libotelinject_arm64.so").exists());
+        assert!(out.join("injector/check-arch.sh").exists());
+        assert!(out.join("sdk.py").exists());
+    }
+
+    #[test]
+    fn recursive_copy_installs_only_matching_injector() {
+        injector_tree_test(CopyType::Recursive);
+    }
+
+    #[test]
+    fn archive_copy_installs_only_matching_injector() {
+        injector_tree_test(CopyType::Archive);
+    }
+
+    fn symlink_tree_test(copy_type: CopyType) {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::create_dir(src.path().join("linux-x64")).unwrap();
+        fs::write(src.path().join("linux-x64/native.so"), b"so").unwrap();
+        fs::write(src.path().join("sdk.py"), b"py").unwrap();
+        unix::fs::symlink(".", src.path().join("glibc")).unwrap();
+        unix::fs::symlink(".", src.path().join("musl")).unwrap();
+        unix::fs::symlink("linux-x64", src.path().join("linux")).unwrap();
+        unix::fs::symlink("does-not-exist", src.path().join("dangling")).unwrap();
+        let out = dst.path().join("out");
+        let copy = |t: CopyType| {
+            do_copy(CopyOperation {
+                source: src.path().to_path_buf(),
+                destination: out.clone(),
+                copy_type: t,
+            })
+        };
+        copy(copy_type).unwrap();
+        for (name, target) in [
+            ("glibc", "."),
+            ("musl", "."),
+            ("linux", "linux-x64"),
+            ("dangling", "does-not-exist"),
+        ] {
+            let p = out.join(name);
+            assert!(p.is_symlink(), "{name} must stay a symlink");
+            assert_eq!(fs::read_link(&p).unwrap(), PathBuf::from(target));
+        }
+        // the links resolve inside the copy, and nothing was duplicated through them
+        assert_eq!(fs::read(out.join("glibc/sdk.py")).unwrap(), b"py");
+        assert_eq!(fs::read(out.join("musl/linux/native.so")).unwrap(), b"so");
+        let entries = fs::read_dir(&out).unwrap().count();
+        assert_eq!(entries, 6);
+        // copying again into the filled destination (an init container that runs again) succeeds
+        copy(CopyType::Recursive).unwrap();
+        assert_eq!(
+            fs::read_link(out.join("glibc")).unwrap(),
+            PathBuf::from(".")
+        );
+    }
+
+    #[test]
+    fn recursive_copy_keeps_symlinks_without_following_them() {
+        symlink_tree_test(CopyType::Recursive);
+    }
+
+    #[test]
+    fn archive_copy_keeps_symlinks_without_following_them() {
+        symlink_tree_test(CopyType::Archive);
     }
 }
